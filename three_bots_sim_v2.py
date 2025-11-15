@@ -1,14 +1,18 @@
 import pygame
 import random
 import math
+import numpy as np
 from typing import List, Tuple, Optional, Dict, Set
 
 # =========================================================
 # Config
 # =========================================================
 WIDTH, HEIGHT = 1280, 720
-MARGIN = 40
-BG = (0, 0, 0)
+BOT_WIDTH = 50  # Bot width
+BOT_HEIGHT = 35  # Bot height
+BOT_MAX_DIM = max(BOT_WIDTH, BOT_HEIGHT)
+MARGIN = BOT_MAX_DIM + 10  # Margin from edges (bot size + buffer)
+BG = (255, 255, 255)
 R_COLORS = {
     "R1": (0, 120, 255),   # blue
     "R2": (40, 200, 40),   # green
@@ -16,7 +20,7 @@ R_COLORS = {
 }
 WP_COLOR = (255, 30, 30)
 HIT_COLOR = (220, 20, 60)
-TEXT_COLOR = (255, 255, 255)
+TEXT_COLOR = (0, 0, 0)
 
 SPEED = {"R1": 120.0, "R2": 110.0, "R3": 100.0}  # px/s
 POINT_R = 7
@@ -27,9 +31,9 @@ RANDOM_SEED = 7
 # Gating behavior
 # - Bots only brake when they are NEAR a blocked crossing (in pixels).
 # - When braking, they stop APPROACH_PIXELS before the crossing.
-NEAR_PIXELS      = 36   # start respecting a block when within this many pixels of the crossing
-APPROACH_PIXELS  = 12   # come to a stop this many pixels BEFORE the crossing
-CLEAR_MARGIN     = 0.01 # fraction along segment after crossing to release queue
+NEAR_PIXELS      = BOT_MAX_DIM + 20   # start respecting a block when within this many pixels of the crossing
+APPROACH_PIXELS  = BOT_MAX_DIM        # come to a stop this many pixels BEFORE the crossing (one bot length)
+CLEAR_MARGIN_PX  = BOT_MAX_DIM * 1.5  # pixels to travel past crossing before releasing queue (1.5x bot size)
 
 # =========================================================
 # Geometry
@@ -63,32 +67,110 @@ def random_point(margin=MARGIN) -> Point:
     return (random.uniform(margin, WIDTH - margin),
             random.uniform(margin, HEIGHT - margin))
 
-def generate_waypoints(n: int = 4, min_sep: float = 80.0) -> List[Point]:
-    pts: List[Point] = []
-    tries = 0
-    while len(pts) < n and tries < 10000:
-        tries += 1
+def generate_waypoints_poisson(n: int = 4, radius: Optional[float] = None) -> List[Point]:
+    """
+    Generate waypoints using Poisson disk sampling.
+    Ensures points are separated by at least 'radius' distance.
+    
+    Args:
+        n: Number of waypoints to generate
+        radius: Minimum separation distance (defaults to 2x bot size)
+    """
+    if radius is None:
+        radius = BOT_MAX_DIM * 2  # Default radius based on bot size
+    
+    # Poisson disk sampling parameters
+    k = 30  # Number of attempts before rejection
+    cell_size = radius / math.sqrt(2)
+    grid_width = int(math.ceil((WIDTH - 2 * MARGIN) / cell_size))
+    grid_height = int(math.ceil((HEIGHT - 2 * MARGIN) / cell_size))
+    grid: List[List[Optional[Point]]] = [[None for _ in range(grid_height)] for _ in range(grid_width)]
+    
+    def grid_coords(p):
+        return (int((p[0] - MARGIN) / cell_size), int((p[1] - MARGIN) / cell_size))
+    
+    def is_valid(p):
+        if p[0] < MARGIN or p[0] >= WIDTH - MARGIN or p[1] < MARGIN or p[1] >= HEIGHT - MARGIN:
+            return False
+        gx, gy = grid_coords(p)
+        # Check neighboring cells
+        for i in range(max(0, gx - 2), min(grid_width, gx + 3)):
+            for j in range(max(0, gy - 2), min(grid_height, gy + 3)):
+                neighbor = grid[i][j]
+                if neighbor and dist(p, neighbor) < radius:
+                    return False
+        return True
+    
+    points = []
+    active = []
+    
+    # Start with a random point
+    first = random_point()
+    points.append(first)
+    active.append(first)
+    gx, gy = grid_coords(first)
+    grid[gx][gy] = first
+    
+    # Generate points using Poisson disk sampling
+    while active and len(points) < n:
+        idx = random.randint(0, len(active) - 1)
+        p = active[idx]
+        found = False
+        
+        for _ in range(k):
+            # Generate random point in annulus between radius and 2*radius
+            angle = random.uniform(0, 2 * math.pi)
+            r = random.uniform(radius, 2 * radius)
+            new_p = (p[0] + r * math.cos(angle), p[1] + r * math.sin(angle))
+            
+            if is_valid(new_p):
+                points.append(new_p)
+                active.append(new_p)
+                gx, gy = grid_coords(new_p)
+                grid[gx][gy] = new_p
+                found = True
+                break
+        
+        if not found:
+            active.pop(idx)
+    
+    # If we didn't get enough points, fill with random ones
+    while len(points) < n:
         p = random_point()
-        if all(dist(p, q) >= min_sep for q in pts):
-            pts.append(p)
-    while len(pts) < n:
-        pts.append(random_point())
-    return pts
+        if all(dist(p, q) >= radius for q in points):
+            points.append(p)
+    
+    return points[:n]
+
+def generate_waypoints(n: int = 4, min_sep: float = 80.0) -> List[Point]:
+    """Legacy function - now uses Poisson distribution"""
+    return generate_waypoints_poisson(n, min_sep)
 
 def generate_waypoints_from(anchor: Tuple[float, float], n: int = 4, min_sep: float = 80.0) -> List[Point]:
-    """First waypoint is the given anchor; others respect min separation."""
+    """First waypoint is the given anchor; others use Poisson distribution."""
     if n < 1:
         return []
+    
+    if min_sep is None:
+        min_sep = BOT_MAX_DIM * 2
+    
     pts: List[Point] = [anchor]
+    remaining = generate_waypoints_poisson(n - 1, min_sep)
+    
+    # Filter out points too close to anchor
+    for p in remaining:
+        if dist(p, anchor) >= min_sep:
+            pts.append(p)
+    
+    # Fill remaining if needed
     tries = 0
-    while len(pts) < n and tries < 10000:
+    while len(pts) < n and tries < 5000:
         tries += 1
         p = random_point()
         if all(dist(p, q) >= min_sep for q in pts):
             pts.append(p)
-    while len(pts) < n:
-        pts.append(random_point())
-    return pts
+    
+    return pts[:n]
 
 def segment_lengths(path: List[Point]) -> List[float]:
     return [dist(path[i], path[i+1]) for i in range(len(path)-1)]
@@ -271,9 +353,12 @@ def new_scenario(seed=None):
     if seed is not None:
         random.seed(seed)
 
-    W = { "R1": generate_waypoints(4, 120),
-          "R2": generate_waypoints(4, 120),
-          "R3": generate_waypoints(4, 120) }
+    # Minimum separation should account for bot size
+    min_separation = BOT_MAX_DIM * 3  # 3x bot size for safe spacing
+    
+    W = { "R1": generate_waypoints(4, min_separation),
+          "R2": generate_waypoints(4, min_separation),
+          "R3": generate_waypoints(4, min_separation) }
 
     bots = {
         "R1": BotState("R1", W["R1"], SPEED["R1"]),
@@ -340,7 +425,8 @@ def regenerate_bot(bots: Dict[str, BotState], name: str):
     """
     b = bots[name]
     anchor = b.pos  # last waypoint when done
-    new_wps = generate_waypoints_from(anchor, n=4, min_sep=120)
+    min_separation = BOT_MAX_DIM * 3  # 3x bot size for safe spacing
+    new_wps = generate_waypoints_from(anchor, n=4, min_sep=min_separation)
 
     # Reset this bot with new path
     b.wps = new_wps
@@ -414,7 +500,9 @@ def step_bot(bot: BotState, dt: float):
     if ptr < len(events):
         other_name, other_seg, t_cross, _ = events[ptr]
         key = norm_key(bot.name, i, other_name, other_seg)
-        if q_head(key) == bot.name and bot.alpha() >= (t_cross + CLEAR_MARGIN - 1e-6):
+        s_cross = t_cross * L
+        # Check if bot has traveled CLEAR_MARGIN_PX past the crossing
+        if q_head(key) == bot.name and bot.s_along >= (s_cross + CLEAR_MARGIN_PX):
             pop_if_head(key, bot.name)
             bot.event_ptr[i] = ptr + 1
 
@@ -485,18 +573,74 @@ while running:
     # Intersections
     draw_intersections(screen, hits)
 
-    # Bots + small heading indicator
+    # Bots as rectangles (4-wheel bot representation)
+    BOT_WIDTH = 50
+    BOT_HEIGHT = 35
+    WHEEL_WIDTH = 12  # Length of wheel (along the side)
+    WHEEL_HEIGHT = 6  # How much wheel sticks out
+    
     for name in ["R1","R2","R3"]:
         p = bots[name].pos
-        pygame.draw.circle(screen, R_COLORS[name], (int(p[0]), int(p[1])), 9)
         bot = bots[name]
-        if not bot.at_end():
-            a, b = bot.segs[bot.seg_idx]
-            dx, dy = b[0]-a[0], b[1]-a[1]
-            L = math.hypot(dx, dy) or 1.0
-            hx = int(p[0] + 16 * dx / L)
-            hy = int(p[1] + 16 * dy / L)
-            pygame.draw.line(screen, R_COLORS[name], (int(p[0]), int(p[1])), (hx, hy), 2)
+        
+        # Draw main bot body (rectangle centered at position)
+        rect_x = int(p[0] - BOT_WIDTH / 2)
+        rect_y = int(p[1] - BOT_HEIGHT / 2)
+        
+        # Bot chassis - dark gray base
+        pygame.draw.rect(screen, (60, 60, 60), (rect_x, rect_y, BOT_WIDTH, BOT_HEIGHT))
+        
+        # Inner colored body (slightly smaller)
+        inner_margin = 4
+        pygame.draw.rect(screen, R_COLORS[name], 
+                        (rect_x + inner_margin, rect_y + inner_margin, 
+                         BOT_WIDTH - 2*inner_margin, BOT_HEIGHT - 2*inner_margin))
+        
+        # Draw 4 wheels as black rectangles on the TOP and BOTTOM sides
+        wheel_color = (40, 40, 40)
+        wheel_x_offset = 8  # Distance from left/right edge to place wheels
+        
+        # Top side wheels
+        # Top-left wheel
+        pygame.draw.rect(screen, wheel_color, 
+                        (rect_x + wheel_x_offset, rect_y - WHEEL_HEIGHT // 2, 
+                         WHEEL_WIDTH, WHEEL_HEIGHT))
+        # Top-right wheel
+        pygame.draw.rect(screen, wheel_color, 
+                        (rect_x + BOT_WIDTH - WHEEL_WIDTH - wheel_x_offset, rect_y - WHEEL_HEIGHT // 2, 
+                         WHEEL_WIDTH, WHEEL_HEIGHT))
+        # Top-right wheel
+        pygame.draw.rect(screen, wheel_color, 
+                        (rect_x + BOT_WIDTH - WHEEL_WIDTH - wheel_x_offset, rect_y - WHEEL_HEIGHT // 2, 
+                         WHEEL_WIDTH, WHEEL_HEIGHT))
+        
+        # Bottom side wheels
+        # Bottom-left wheel
+        pygame.draw.rect(screen, wheel_color, 
+                        (rect_x + wheel_x_offset, rect_y + BOT_HEIGHT - WHEEL_HEIGHT // 2, 
+                         WHEEL_WIDTH, WHEEL_HEIGHT))
+        # Bottom-right wheel
+        pygame.draw.rect(screen, wheel_color, 
+                        (rect_x + BOT_WIDTH - WHEEL_WIDTH - wheel_x_offset, rect_y + BOT_HEIGHT - WHEEL_HEIGHT // 2, 
+                         WHEEL_WIDTH, WHEEL_HEIGHT))
+        
+        # Draw detection marker box (like AprilTag in the image)
+        marker_size = 20
+        marker_x = int(p[0] - marker_size / 2)
+        marker_y = int(p[1] - marker_size / 2)
+        
+        # White border
+        pygame.draw.rect(screen, (255, 255, 255), 
+                        (marker_x - 2, marker_y - 2, marker_size + 4, marker_size + 4))
+        # Gray marker
+        pygame.draw.rect(screen, (100, 100, 100), 
+                        (marker_x, marker_y, marker_size, marker_size))
+        
+        # Bot number in center
+        font_marker = pygame.font.Font(None, 24)
+        label_surf = font_marker.render(name[-1], True, (255, 255, 255))
+        label_rect = label_surf.get_rect(center=(int(p[0]), int(p[1])))
+        screen.blit(label_surf, label_rect)
 
     # Pair matrices (top-left grid)
     render_matrix(screen, "R1 vs R2", mats["12"], (10, 10))
